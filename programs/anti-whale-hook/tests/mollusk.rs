@@ -61,6 +61,18 @@ fn hook_init_manifest_lists_config() {
 }
 
 #[test]
+fn hook_init_manifest_is_well_formed() {
+    let prefixes = init_account_prefixes();
+    assert_eq!(prefixes, vec![std::str::from_utf8(anti_whale_hook::CONFIG_SEED).unwrap()]);
+    assert!((1..=5).contains(&prefixes.len()), "server accepts at most 5 state accounts");
+    for prefix in &prefixes {
+        // Must be a usable seed and must not collide with the metas PDA.
+        assert!(prefix.len() <= 32);
+        assert_ne!(prefix.as_bytes(), anti_whale_hook::EXTRA_ACCOUNT_METAS_SEED);
+    }
+}
+
+#[test]
 fn initialize_with_server_account_layout() {
     let mollusk = mollusk();
     let s = init_setup(None, Some(&PROGRAM_ID));
@@ -197,6 +209,69 @@ fn initialize_requires_state_accounts() {
 }
 
 #[test]
+fn initialize_rejects_wrong_system_program() {
+    let mollusk = mollusk();
+    let mut s = init_setup(None, Some(&PROGRAM_ID));
+    let mut ix = initialize_ix(&s.mint, &s.authority);
+    let fake = Pubkey::new_unique();
+    ix.accounts[3].pubkey = fake;
+    s.accounts[3] = (fake, system_account(0));
+    let result = mollusk.process_instruction(&ix, &s.accounts);
+    assert_eq!(result.program_result, ProgramResult::Failure(ProgramError::IncorrectProgramId));
+}
+
+#[test]
+fn initialize_requires_writable_accounts() {
+    let mollusk = mollusk();
+    // [2] payer, [0] metas PDA, [4] config PDA.
+    for index in [2, 0, 4] {
+        let s = init_setup(None, Some(&PROGRAM_ID));
+        let mut ix = initialize_ix(&s.mint, &s.authority);
+        ix.accounts[index].is_writable = false;
+        let result = mollusk.process_instruction(&ix, &s.accounts);
+        assert_eq!(
+            result.program_result,
+            ProgramResult::Failure(ProgramError::InvalidAccountData),
+            "account {index} read-only"
+        );
+    }
+}
+
+#[test]
+fn initialize_rejects_mint_without_authority_or_uninitialized() {
+    let mollusk = mollusk();
+    // Fixed-supply mint (authority revoked).
+    let mut s = init_setup(None, Some(&PROGRAM_ID));
+    s.accounts[1].1.data = mint_data(None, Some(&PROGRAM_ID), 0);
+    let result = mollusk.process_instruction(&initialize_ix(&s.mint, &s.authority), &s.accounts);
+    assert_eq!(result.program_result, custom(HookError::InvalidMint));
+
+    // `is_initialized` flag cleared.
+    let mut s = init_setup(None, Some(&PROGRAM_ID));
+    s.accounts[1].1.data[45] = 0;
+    let result = mollusk.process_instruction(&initialize_ix(&s.mint, &s.authority), &s.accounts);
+    assert_eq!(result.program_result, custom(HookError::InvalidMint));
+
+    // Data shorter than a mint.
+    let mut s = init_setup(None, Some(&PROGRAM_ID));
+    s.accounts[1].1.data.truncate(40);
+    let result = mollusk.process_instruction(&initialize_ix(&s.mint, &s.authority), &s.accounts);
+    assert_eq!(result.program_result, custom(HookError::InvalidMint));
+}
+
+#[test]
+fn initialize_fails_if_only_config_exists() {
+    let mollusk = mollusk();
+    let mut s = init_setup(None, Some(&PROGRAM_ID));
+    let first = mollusk.process_instruction(&initialize_ix(&s.mint, &s.authority), &s.accounts);
+    assert_eq!(first.program_result, ProgramResult::Success);
+    // Keep the initialized config, reset the metas PDA to an empty account.
+    s.accounts[4].1 = first.get_account(&config_pda(&s.mint).0).unwrap().clone();
+    let result = mollusk.process_instruction(&initialize_ix(&s.mint, &s.authority), &s.accounts);
+    assert_eq!(result.program_result, custom(HookError::AlreadyInitialized));
+}
+
+#[test]
 fn initialize_twice_fails() {
     let mollusk = mollusk();
     let s = init_setup(None, Some(&PROGRAM_ID));
@@ -321,6 +396,77 @@ fn execute_rejects_config_of_another_mint() {
     ix.accounts[5].pubkey = other_config.0;
     let result = mollusk().process_instruction(&ix, &accounts);
     assert_eq!(result.program_result, custom(HookError::InvalidConfigAccount));
+}
+
+#[test]
+fn execute_checks_source_transferring_flag_only() {
+    // Destination flagged, source not: still rejected.
+    let mut s = exec_setup(false);
+    let last = s.accounts[2].1.data.len() - 1;
+    s.accounts[2].1.data[last] = 1;
+    assert_eq!(exec(&s, 1).program_result, custom(HookError::NotTransferring));
+
+    // Source flagged, destination not: the source flag is what matters.
+    let mut s = exec_setup(true);
+    let last = s.accounts[2].1.data.len() - 1;
+    s.accounts[2].1.data[last] = 0;
+    assert_eq!(exec(&s, 1).program_result, ProgramResult::Success);
+}
+
+#[test]
+fn execute_reads_limit_from_config() {
+    let mut s = exec_setup(true);
+    s.accounts[5].1.data[40..48].copy_from_slice(&100u64.to_le_bytes());
+    assert_eq!(exec(&s, 100).program_result, ProgramResult::Success);
+    assert_eq!(exec(&s, 101).program_result, custom(HookError::TransferAmountExceedsLimit));
+}
+
+#[test]
+fn execute_rejects_tampered_config() {
+    // Valid data, but owned by another program.
+    let mut s = exec_setup(true);
+    s.accounts[5].1.owner = Pubkey::new_unique();
+    assert_eq!(exec(&s, 1).program_result, custom(HookError::ConfigNotInitialized));
+
+    // Wrong length.
+    let mut s = exec_setup(true);
+    s.accounts[5].1.data.push(0);
+    assert_eq!(exec(&s, 1).program_result, custom(HookError::ConfigNotInitialized));
+
+    // Wrong discriminator.
+    let mut s = exec_setup(true);
+    s.accounts[5].1.data[0] ^= 0xff;
+    assert_eq!(exec(&s, 1).program_result, custom(HookError::ConfigNotInitialized));
+
+    // Stored mint differs from the transferred mint.
+    let mut s = exec_setup(true);
+    s.accounts[5].1.data[8..40].copy_from_slice(Pubkey::new_unique().as_ref());
+    assert_eq!(exec(&s, 1).program_result, custom(HookError::InvalidConfigAccount));
+
+    // Stored bump does not derive the config address.
+    let mut s = exec_setup(true);
+    s.accounts[5].1.data[48] = s.accounts[5].1.data[48].wrapping_sub(1);
+    assert_eq!(exec(&s, 1).program_result, custom(HookError::InvalidConfigAccount));
+}
+
+#[test]
+fn execute_rejects_valid_config_at_non_pda_address() {
+    let s = exec_setup(true);
+    let mut accounts = s.accounts.clone();
+    let fake = Pubkey::new_unique();
+    accounts[5].0 = fake;
+    let mut ix = execute_ix(&s.source, &s.mint, &s.destination, &s.owner, 1);
+    ix.accounts[5].pubkey = fake;
+    let result = mollusk().process_instruction(&ix, &accounts);
+    assert_eq!(result.program_result, custom(HookError::InvalidConfigAccount));
+}
+
+#[test]
+fn execute_checks_caller_before_amount() {
+    // An over-limit amount on a direct call is reported as NotTransferring,
+    // i.e. the caller check runs before anything else.
+    let s = exec_setup(false);
+    assert_eq!(exec(&s, u64::MAX).program_result, custom(HookError::NotTransferring));
 }
 
 #[test]

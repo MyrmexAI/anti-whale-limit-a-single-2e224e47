@@ -26,19 +26,87 @@ pub fn extra_metas_pda(mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[EXTRA_ACCOUNT_METAS_SEED, mint.as_ref()], &PROGRAM_ID).0
 }
 
+/// Prefixes listed in `hook-init.json`, in order. The file must be exactly
+/// `{"initAccounts": ["p1", ...]}` (whitespace aside), as the server expects.
+pub fn init_account_prefixes() -> Vec<String> {
+    let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/hook-init.json"))
+        .expect("hook-init.json");
+    let compact: String = manifest.chars().filter(|c| !c.is_whitespace()).collect();
+    let list = compact
+        .strip_prefix(r#"{"initAccounts":["#)
+        .and_then(|rest| rest.strip_suffix("]}"))
+        .unwrap_or_else(|| panic!("hook-init.json must be {{\"initAccounts\": [..]}}, got {manifest}"));
+    list.split(',')
+        .map(|item| {
+            let prefix = item
+                .strip_prefix('"')
+                .and_then(|p| p.strip_suffix('"'))
+                .unwrap_or_else(|| panic!("prefix {item} is not a JSON string"));
+            assert!(!prefix.is_empty() && !prefix.contains(['"', '\\']), "bad prefix {item}");
+            prefix.to_string()
+        })
+        .collect()
+}
+
 /// Derives the state accounts listed in `hook-init.json`, in order, the way
 /// the server does: PDAs of this program with seeds `[prefix, mint]`.
 pub fn init_state_accounts(mint: &Pubkey) -> Vec<Pubkey> {
-    let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/hook-init.json"))
-        .expect("hook-init.json");
-    let start = manifest.find('[').expect("initAccounts array") + 1;
-    let end = manifest.find(']').expect("initAccounts array");
-    manifest[start..end]
-        .split(',')
-        .map(|p| p.trim().trim_matches('"'))
-        .filter(|p| !p.is_empty())
+    init_account_prefixes()
+        .iter()
         .map(|prefix| Pubkey::find_program_address(&[prefix.as_bytes(), mint.as_ref()], &PROGRAM_ID).0)
         .collect()
+}
+
+/// Resolves the extra accounts of `Execute` from the on-chain extra account
+/// metas data the way a client does (`spl-tlv-account-resolution`), given the
+/// keys of the base Execute accounts `[source, mint, destination, owner,
+/// extra metas]` and the instruction data. Only fixed addresses and PDAs of
+/// the hook program built from literals, instruction data and account keys
+/// are supported: anything else is not derivable from the transfer alone.
+pub fn resolve_execute_extra_accounts(metas: &[u8], base: &[Pubkey; 5], ix_data: &[u8]) -> Vec<AccountMeta> {
+    assert_eq!(metas[0..8], EXECUTE_DISCRIMINATOR, "TLV entry is not for Execute");
+    let value_len = u32::from_le_bytes(metas[8..12].try_into().unwrap()) as usize;
+    let value = &metas[12..12 + value_len];
+    let count = u32::from_le_bytes(value[0..4].try_into().unwrap()) as usize;
+    assert_eq!(value_len, 4 + 35 * count, "PodSlice length");
+
+    let mut keys: Vec<Pubkey> = base.to_vec();
+    let mut resolved = Vec::new();
+    for entry in value[4..].chunks_exact(35) {
+        let config = &entry[1..33];
+        let key = match entry[0] {
+            0 => Pubkey::try_from(config).unwrap(),
+            1 => {
+                let mut seeds: Vec<Vec<u8>> = Vec::new();
+                let mut i = 0;
+                while i < config.len() && config[i] != 0 {
+                    match config[i] {
+                        1 => {
+                            let len = config[i + 1] as usize;
+                            seeds.push(config[i + 2..i + 2 + len].to_vec());
+                            i += 2 + len;
+                        }
+                        2 => {
+                            let (index, len) = (config[i + 1] as usize, config[i + 2] as usize);
+                            seeds.push(ix_data[index..index + len].to_vec());
+                            i += 3;
+                        }
+                        3 => {
+                            seeds.push(keys[config[i + 1] as usize].to_bytes().to_vec());
+                            i += 2;
+                        }
+                        other => panic!("seed type {other} is not derivable from the transfer"),
+                    }
+                }
+                let seeds: Vec<&[u8]> = seeds.iter().map(|s| s.as_slice()).collect();
+                Pubkey::find_program_address(&seeds, &PROGRAM_ID).0
+            }
+            other => panic!("extra account meta type {other} is not supported"),
+        };
+        keys.push(key);
+        resolved.push(AccountMeta { pubkey: key, is_signer: entry[33] != 0, is_writable: entry[34] != 0 });
+    }
+    resolved
 }
 
 pub fn config_pda(mint: &Pubkey) -> (Pubkey, u8) {
@@ -126,6 +194,21 @@ pub fn mint_to_ix(mint: &Pubkey, destination: &Pubkey, authority: &Pubkey, amoun
             AccountMeta::new(*mint, false),
             AccountMeta::new(*destination, false),
             AccountMeta::new_readonly(*authority, true),
+        ],
+        data,
+    }
+}
+
+/// `Approve`: lets `delegate` move up to `amount` from `source`.
+pub fn approve_ix(source: &Pubkey, delegate: &Pubkey, owner: &Pubkey, amount: u64) -> Instruction {
+    let mut data = vec![4];
+    data.extend_from_slice(&amount.to_le_bytes());
+    Instruction {
+        program_id: TOKEN_2022,
+        accounts: vec![
+            AccountMeta::new(*source, false),
+            AccountMeta::new_readonly(*delegate, false),
+            AccountMeta::new_readonly(*owner, true),
         ],
         data,
     }
